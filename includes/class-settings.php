@@ -66,8 +66,10 @@ class SecuritySettings {
             'max_query_length' => get_option('security_max_query_length', 500),
             '410_page_content' => get_option('security_410_page_content', ''),
             'enable_seo_features' => get_option('security_enable_seo_features', true),
-            // Bot Protection options
+            // Enhanced Bot Protection options
             'enable_bot_protection' => get_option('security_enable_bot_protection', true),
+            'protect_admin' => get_option('security_protect_admin', false),
+            'protect_login' => get_option('security_protect_login', false),
             'bot_whitelist_agents' => get_option('security_bot_whitelist_agents', ''),
             'bot_whitelist_ips' => get_option('security_bot_whitelist_ips', ''),
             'bot_blacklist_agents' => get_option('security_bot_blacklist_agents', ''),
@@ -148,23 +150,52 @@ class SecuritySettings {
                 <div id="bot-protection-tab" class="tab-content" style="display:none;">
                     <table class="form-table">
                         <tr>
-                            <th>Bot Protection</th>
+                            <th>🛡️ Enhanced Bot Protection</th>
                             <td>
                                 <label>
                                     <input type="checkbox" name="enable_bot_protection" value="1" <?php checked($options['enable_bot_protection']); ?>>
-                                    Enable Bad Bot Protection & Blackhole
+                                    Enable Smart Bot Protection & Blackhole
                                 </label>
-                                <p class="description">🕳️ Creates invisible traps that catch bad bots while allowing good bots and humans</p>
+                                <p class="description">🕳️ Advanced bot detection with scoring system that protects real users</p>
                                 
                                 <div style="background: #f0f8ff; padding: 15px; margin: 10px 0; border-left: 4px solid #0073aa;">
-                                    <strong>Features:</strong>
+                                    <strong>🚀 Enhanced Features:</strong>
                                     <ul style="margin: 10px 0 0 20px;">
-                                        <li>✅ Stops leeches, scanners, and spammers</li>
-                                        <li>✅ Saves server resources for humans and good bots</li>
-                                        <li>✅ Improves traffic quality and overall site security</li>
-                                        <li>✅ Works silently behind the scenes with 0% performance impact</li>
-                                        <li>✅ Automatic robots.txt integration</li>
-                                        <li>✅ Real-time bot detection and blocking</li>
+                                        <li>✅ <strong>Smart Detection:</strong> Uses scoring system instead of instant blocking</li>
+                                        <li>✅ <strong>Admin Protection:</strong> Never blocks logged-in users or admins</li>
+                                        <li>✅ <strong>Browser Recognition:</strong> Identifies legitimate browsers automatically</li>
+                                        <li>✅ <strong>Behavioral Analysis:</strong> Analyzes patterns before blocking</li>
+                                        <li>✅ <strong>IP Range Support:</strong> Supports CIDR notation for whitelisting</li>
+                                        <li>✅ <strong>Hit Tracking:</strong> Tracks repeated violations per IP</li>
+                                        <li>✅ <strong>Easy Management:</strong> One-click whitelist from logs</li>
+                                    </ul>
+                                </div>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th>Protection Scope</th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" name="protect_admin" value="1" <?php checked($options['protect_admin']); ?>>
+                                    Protect Admin Area (/wp-admin/)
+                                </label>
+                                <p class="description">⚠️ Enable bot protection for admin area (not recommended - may block legitimate users)</p>
+                                
+                                <br><br>
+                                <label>
+                                    <input type="checkbox" name="protect_login" value="1" <?php checked($options['protect_login']); ?>>
+                                    Protect Login Page (wp-login.php)
+                                </label>
+                                <p class="description">⚠️ Enable bot protection for login page (use with caution)</p>
+                                
+                                <div style="background: #fff3cd; padding: 10px; margin: 10px 0; border-left: 4px solid #ffc107;">
+                                    <strong>⚠️ Important:</strong> Bot protection is automatically disabled for:
+                                    <ul style="margin: 5px 0 0 20px;">
+                                        <li>• All logged-in users</li>
+                                        <li>• Users with admin capabilities</li>
+                                        <li>• WordPress core requests</li>
+                                        <li>• Whitelisted IPs and user agents</li>
                                     </ul>
                                 </div>
                             </td>
@@ -181,8 +212,12 @@ class SecuritySettings {
                         <tr>
                             <th>Whitelisted IPs</th>
                             <td>
-                                <textarea name="bot_whitelist_ips" rows="5" cols="50" class="large-text" placeholder="127.0.0.1&#10;192.168.1.1"><?php echo esc_textarea($options['bot_whitelist_ips']); ?></textarea>
-                                <p class="description">Enter one IP address per line. These IPs will never be blocked.</p>
+                                <textarea name="bot_whitelist_ips" rows="5" cols="50" class="large-text" placeholder="127.0.0.1&#10;192.168.1.0/24&#10;203.0.113.0"><?php echo esc_textarea($options['bot_whitelist_ips']); ?></textarea>
+                                <p class="description">Enter one IP address per line. Supports single IPs and CIDR ranges (e.g., 192.168.1.0/24). These IPs will never be blocked.</p>
+                                
+                                <div style="background: #d4edda; padding: 10px; margin: 10px 0; border-left: 4px solid #28a745;">
+                                    <strong>💡 Pro Tip:</strong> Your current IP is automatically whitelisted. Server IPs (127.0.0.1, ::1) are also protected by default.
+                                </div>
                             </td>
                         </tr>
 
@@ -476,6 +511,11 @@ class SecuritySettings {
             return;
         }
 
+        // Handle actions
+        if (isset($_POST['action']) && check_admin_referer('bot_logs_nonce', 'bot_nonce')) {
+            $this->handle_bot_log_actions();
+        }
+
         // Initialize bot blackhole to get stats
         $bot_blackhole = new BotBlackhole();
         $stats = $bot_blackhole->get_blocked_bots_stats();
@@ -483,13 +523,7 @@ class SecuritySettings {
         global $wpdb;
         $table_name = $wpdb->prefix . 'security_blocked_bots';
         
-        // Handle actions
-        if (isset($_POST['clear_logs']) && check_admin_referer('bot_logs_nonce', 'bot_nonce')) {
-            $wpdb->query("TRUNCATE TABLE {$table_name}");
-            echo '<div class="notice notice-success"><p>Bot logs cleared successfully.</p></div>';
-        }
-        
-        // Get recent logs
+        // Get recent logs with proper null handling
         $logs = $wpdb->get_results(
             "SELECT * FROM {$table_name} ORDER BY timestamp DESC LIMIT 100",
             ARRAY_A
@@ -497,19 +531,19 @@ class SecuritySettings {
         
         ?>
         <div class="wrap">
-            <h1>🕳️ Bot Protection Logs</h1>
+            <h1>🛡️ Enhanced Bot Protection Logs</h1>
             
             <div class="bot-stats" style="display: flex; gap: 20px; margin: 20px 0;">
                 <div class="stat-box" style="background: #f0f8ff; padding: 15px; border-radius: 8px; text-align: center; min-width: 120px;">
-                    <h3 style="margin: 0; color: #0073aa;"><?php echo number_format($stats['total']); ?></h3>
+                    <h3 style="margin: 0; color: #0073aa;"><?php echo number_format($stats['total'] ?? 0); ?></h3>
                     <p style="margin: 5px 0 0 0;">Total Blocked</p>
                 </div>
                 <div class="stat-box" style="background: #f0fff0; padding: 15px; border-radius: 8px; text-align: center; min-width: 120px;">
-                    <h3 style="margin: 0; color: #46b450;"><?php echo number_format($stats['today']); ?></h3>
+                    <h3 style="margin: 0; color: #46b450;"><?php echo number_format($stats['today'] ?? 0); ?></h3>
                     <p style="margin: 5px 0 0 0;">Today</p>
                 </div>
                 <div class="stat-box" style="background: #fff8f0; padding: 15px; border-radius: 8px; text-align: center; min-width: 120px;">
-                    <h3 style="margin: 0; color: #f56e28;"><?php echo number_format($stats['week']); ?></h3>
+                    <h3 style="margin: 0; color: #f56e28;"><?php echo number_format($stats['week'] ?? 0); ?></h3>
                     <p style="margin: 5px 0 0 0;">This Week</p>
                 </div>
             </div>
@@ -521,14 +555,29 @@ class SecuritySettings {
                     <thead>
                         <tr>
                             <th>IP Address</th>
-                            <th>Block Count</th>
+                            <th>Total Hits</th>
+                            <th>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
                         <?php foreach ($stats['top_ips'] as $ip_data): ?>
                         <tr>
-                            <td><?php echo esc_html($ip_data['ip_address']); ?></td>
-                            <td><?php echo number_format($ip_data['count']); ?></td>
+                            <td><code><?php echo esc_html($ip_data['ip_address']); ?></code></td>
+                            <td><?php echo number_format($ip_data['count'] ?? 0); ?></td>
+                            <td>
+                                <form method="post" style="display: inline;">
+                                    <?php wp_nonce_field('bot_logs_nonce', 'bot_nonce'); ?>
+                                    <input type="hidden" name="action" value="whitelist_ip">
+                                    <input type="hidden" name="ip_address" value="<?php echo esc_attr($ip_data['ip_address']); ?>">
+                                    <input type="submit" class="button button-small" value="Whitelist" onclick="return confirm('Are you sure you want to whitelist this IP?');">
+                                </form>
+                                <form method="post" style="display: inline;">
+                                    <?php wp_nonce_field('bot_logs_nonce', 'bot_nonce'); ?>
+                                    <input type="hidden" name="action" value="unblock_ip">
+                                    <input type="hidden" name="ip_address" value="<?php echo esc_attr($ip_data['ip_address']); ?>">
+                                    <input type="submit" class="button button-small" value="Unblock" onclick="return confirm('Are you sure you want to unblock this IP?');">
+                                </form>
+                            </td>
                         </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -539,53 +588,132 @@ class SecuritySettings {
             <div class="bot-logs-actions" style="margin: 20px 0;">
                 <form method="post" style="display: inline;">
                     <?php wp_nonce_field('bot_logs_nonce', 'bot_nonce'); ?>
-                    <input type="submit" name="clear_logs" class="button button-secondary" value="Clear All Logs" onclick="return confirm('Are you sure you want to clear all bot logs?');">
+                    <input type="hidden" name="action" value="clear_logs">
+                    <input type="submit" class="button button-secondary" value="Clear All Logs" onclick="return confirm('Are you sure you want to clear all bot logs?');">
                 </form>
             </div>
             
-            <h3>Recent Bot Blocks (Last 100)</h3>
+            <h3>Recent Bot Activity (Last 100)</h3>
             <?php if (empty($logs)): ?>
-                <p>No bots have been blocked yet. The blackhole is ready and waiting! 🕳️</p>
+                <p>No bot activity recorded yet. The enhanced protection system is ready and monitoring! 🛡️</p>
             <?php else: ?>
             <table class="wp-list-table widefat fixed striped">
                 <thead>
                     <tr>
-                        <th style="width: 15%;">Date/Time</th>
-                        <th style="width: 12%;">IP Address</th>
-                        <th style="width: 25%;">User Agent</th>
-                        <th style="width: 25%;">Request URI</th>
+                        <th style="width: 12%;">Date/Time</th>
+                        <th style="width: 10%;">IP Address</th>
+                        <th style="width: 20%;">User Agent</th>
+                        <th style="width: 20%;">Request URI</th>
                         <th style="width: 15%;">Referrer</th>
-                        <th style="width: 8%;">Reason</th>
+                        <th style="width: 15%;">Reason</th>
+                        <th style="width: 8%;">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php foreach ($logs as $log): ?>
-                    <tr>
+                    <?php 
+                    $status = isset($log['status']) ? (int)$log['status'] : 0;
+                    $hits = isset($log['hits']) ? (int)$log['hits'] : 1;
+                    ?>
+                    <tr class="<?php echo $status == 1 ? 'blocked' : 'suspicious'; ?>">
                         <td><?php echo esc_html(date('M j, Y H:i', strtotime($log['timestamp']))); ?></td>
                         <td><code><?php echo esc_html($log['ip_address']); ?></code></td>
-                        <td style="word-break: break-all; font-size: 11px;"><?php echo esc_html(substr($log['user_agent'], 0, 100)); ?><?php echo strlen($log['user_agent']) > 100 ? '...' : ''; ?></td>
-                        <td style="word-break: break-all; font-size: 11px;"><?php echo esc_html(substr($log['request_uri'], 0, 80)); ?><?php echo strlen($log['request_uri']) > 80 ? '...' : ''; ?></td>
-                        <td style="word-break: break-all; font-size: 11px;"><?php echo esc_html(substr($log['referrer'], 0, 50)); ?><?php echo strlen($log['referrer']) > 50 ? '...' : ''; ?></td>
-                        <td><span class="dashicons dashicons-warning" style="color: #d63638;"></span> <?php echo esc_html($log['block_reason']); ?></td>
+                        <td style="word-break: break-all; font-size: 11px;"><?php echo esc_html(substr($log['user_agent'], 0, 80)); ?><?php echo strlen($log['user_agent']) > 80 ? '...' : ''; ?></td>
+                        <td style="word-break: break-all; font-size: 11px;"><?php echo esc_html(substr($log['request_uri'], 0, 60)); ?><?php echo strlen($log['request_uri']) > 60 ? '...' : ''; ?></td>
+                        <td style="word-break: break-all; font-size: 11px;"><?php echo esc_html(substr($log['referrer'] ?? '', 0, 40)); ?><?php echo strlen($log['referrer'] ?? '') > 40 ? '...' : ''; ?></td>
+                        <td>
+                            <?php if ($status == 1): ?>
+                                <span class="dashicons dashicons-warning" style="color: #d63638;"></span> <?php echo esc_html($log['block_reason']); ?>
+                                <?php if ($hits > 1): ?>
+                                    <br><small>(<?php echo $hits; ?> hits)</small>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <span class="dashicons dashicons-info" style="color: #f56e28;"></span> <?php echo esc_html($log['block_reason']); ?>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php if ($status == 1): ?>
+                                <form method="post" style="display: inline;">
+                                    <?php wp_nonce_field('bot_logs_nonce', 'bot_nonce'); ?>
+                                    <input type="hidden" name="action" value="whitelist_ip">
+                                    <input type="hidden" name="ip_address" value="<?php echo esc_attr($log['ip_address']); ?>">
+                                    <input type="submit" class="button button-small" value="Whitelist" title="Add to whitelist and unblock">
+                                </form>
+                            <?php endif; ?>
+                        </td>
                     </tr>
                     <?php endforeach; ?>
                 </tbody>
             </table>
+            
+            <style>
+            .blocked { background-color: #ffeaea; }
+            .suspicious { background-color: #fff8e1; }
+            </style>
             <?php endif; ?>
             
             <div style="margin-top: 30px; padding: 20px; background: #f9f9f9; border-radius: 8px;">
-                <h3>🛡️ How Bot Protection Works</h3>
+                <h3>🛡️ How Enhanced Bot Protection Works</h3>
                 <ul style="list-style-type: disc; margin-left: 20px;">
-                    <li><strong>Invisible Blackhole Traps:</strong> Hidden links that only bots follow</li>
-                    <li><strong>User Agent Analysis:</strong> Detects known bad bots and suspicious patterns</li>
-                    <li><strong>Behavioral Detection:</strong> Identifies bot-like behavior patterns</li>
-                    <li><strong>IP Caching:</strong> Fast blocking of previously identified bad IPs</li>
-                    <li><strong>Robots.txt Integration:</strong> Warns bots away from trap URLs</li>
-                    <li><strong>Zero Performance Impact:</strong> Optimized for speed with smart caching</li>
+                    <li><strong>🧠 Smart Scoring System:</strong> Analyzes multiple factors before blocking</li>
+                    <li><strong>👤 User Protection:</strong> Never blocks logged-in users or admins</li>
+                    <li><strong>🌐 Browser Recognition:</strong> Automatically identifies legitimate browsers</li>
+                    <li><strong>📊 Behavioral Analysis:</strong> Tracks patterns and repeat offenders</li>
+                    <li><strong>🎯 Targeted Blocking:</strong> Only blocks when confidence is high</li>
+                    <li><strong>⚡ Performance Optimized:</strong> Cached checks for minimal impact</li>
+                    <li><strong>🔧 Easy Management:</strong> One-click whitelist from logs interface</li>
+                </ul>
+                
+                <h4>🎯 Detection Criteria:</h4>
+                <ul style="list-style-type: disc; margin-left: 20px;">
+                    <li><strong>Score 0-30:</strong> Legitimate traffic (no action)</li>
+                    <li><strong>Score 31-69:</strong> Suspicious activity (logged only)</li>
+                    <li><strong>Score 70-99:</strong> High suspicion (logged with warning)</li>
+                    <li><strong>Score 100+:</strong> Confirmed bot (blocked)</li>
                 </ul>
             </div>
         </div>
         <?php
+    }
+
+    private function handle_bot_log_actions() {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        $action = $_POST['action'];
+        $bot_blackhole = new BotBlackhole();
+        
+        switch ($action) {
+            case 'clear_logs':
+                global $wpdb;
+                $table_name = $wpdb->prefix . 'security_blocked_bots';
+                $wpdb->query("TRUNCATE TABLE {$table_name}");
+                echo '<div class="notice notice-success"><p>Bot logs cleared successfully.</p></div>';
+                break;
+                
+            case 'whitelist_ip':
+                if (isset($_POST['ip_address'])) {
+                    $ip = sanitize_text_field($_POST['ip_address']);
+                    if ($bot_blackhole->whitelist_ip($ip)) {
+                        echo '<div class="notice notice-success"><p>IP ' . esc_html($ip) . ' has been whitelisted and unblocked.</p></div>';
+                    } else {
+                        echo '<div class="notice notice-error"><p>Failed to whitelist IP or IP already whitelisted.</p></div>';
+                    }
+                }
+                break;
+                
+            case 'unblock_ip':
+                if (isset($_POST['ip_address'])) {
+                    $ip = sanitize_text_field($_POST['ip_address']);
+                    if ($bot_blackhole->unblock_ip($ip)) {
+                        echo '<div class="notice notice-success"><p>IP ' . esc_html($ip) . ' has been unblocked.</p></div>';
+                    } else {
+                        echo '<div class="notice notice-error"><p>Failed to unblock IP.</p></div>';
+                    }
+                }
+                break;
+        }
     }
 
     private function save_settings() {
@@ -633,8 +761,10 @@ class SecuritySettings {
         update_option('security_max_query_length', intval($_POST['max_query_length']));
         update_option('security_410_page_content', wp_kses_post($_POST['410_page_content']));
         
-        // Bot Protection settings
+        // Enhanced Bot Protection settings
         update_option('security_enable_bot_protection', isset($_POST['enable_bot_protection']));
+        update_option('security_protect_admin', isset($_POST['protect_admin']));
+        update_option('security_protect_login', isset($_POST['protect_login']));
         update_option('security_bot_whitelist_agents', sanitize_textarea_field($_POST['bot_whitelist_agents']));
         update_option('security_bot_whitelist_ips', sanitize_textarea_field($_POST['bot_whitelist_ips']));
         update_option('security_bot_blacklist_agents', sanitize_textarea_field($_POST['bot_blacklist_agents']));
@@ -660,9 +790,9 @@ class SecuritySettings {
             'security_max_filter_sizes', 'security_max_filter_brands',
             'security_max_total_filters', 'security_max_query_params',
             'security_max_query_length', 'security_410_page_content',
-            // Bot Protection settings
-            'security_enable_bot_protection', 'security_bot_whitelist_agents',
-            'security_bot_whitelist_ips', 'security_bot_blacklist_agents',
+            // Enhanced Bot Protection settings
+            'security_enable_bot_protection', 'security_protect_admin', 'security_protect_login',
+            'security_bot_whitelist_agents', 'security_bot_whitelist_ips', 'security_bot_blacklist_agents',
             'security_bot_email_alerts', 'security_bot_alert_email',
             'security_bot_block_status', 'security_bot_block_message',
             'security_bot_custom_message'
