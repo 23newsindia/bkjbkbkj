@@ -12,6 +12,8 @@ class BotBlackhole {
     private $whitelisted_ips_cache = null;
     private $table_name;
     private static $is_admin = null;
+    private $whitelist_cache = null;
+    private $db_version = '1.1'; // Updated version for schema changes
     
     public function __construct() {
         global $wpdb;
@@ -21,6 +23,10 @@ class BotBlackhole {
         if (self::$is_admin === null) {
             self::$is_admin = is_admin();
         }
+        
+        // Ensure table exists and is up to date
+        $this->ensure_table_exists();
+        $this->maybe_upgrade_table();
         
         // Only initialize if bot protection is enabled
         if ($this->get_option('security_enable_bot_protection', true)) {
@@ -51,9 +57,6 @@ class BotBlackhole {
         
         // Schedule cleanup
         add_action('admin_init', array($this, 'schedule_cleanup'));
-        
-        // Ensure table exists
-        $this->ensure_table_exists();
     }
     
     private function ensure_table_exists() {
@@ -68,18 +71,68 @@ class BotBlackhole {
             referrer text,
             timestamp datetime NOT NULL,
             block_reason varchar(100) NOT NULL,
+            status tinyint(1) DEFAULT 1,
+            hits int(11) DEFAULT 1,
             PRIMARY KEY  (id),
             KEY ip_timestamp (ip_address, timestamp),
-            KEY user_agent_key (user_agent(100))
+            KEY user_agent_key (user_agent(100)),
+            KEY status_key (status)
         ) $charset_collate;";
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
         dbDelta($sql);
+        
+        // Update database version
+        update_option('security_bot_db_version', $this->db_version);
+    }
+    
+    private function maybe_upgrade_table() {
+        $installed_version = get_option('security_bot_db_version', '1.0');
+        
+        if (version_compare($installed_version, $this->db_version, '<')) {
+            $this->upgrade_table($installed_version);
+        }
+    }
+    
+    private function upgrade_table($from_version) {
+        global $wpdb;
+        
+        // Check if table exists first
+        $table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$this->table_name}'") === $this->table_name;
+        
+        if (!$table_exists) {
+            $this->ensure_table_exists();
+            return;
+        }
+        
+        // Get current table structure
+        $columns = $wpdb->get_results("DESCRIBE {$this->table_name}");
+        $column_names = array();
+        foreach ($columns as $column) {
+            $column_names[] = $column->Field;
+        }
+        
+        // Add missing columns
+        if (!in_array('status', $column_names)) {
+            $wpdb->query("ALTER TABLE {$this->table_name} ADD COLUMN status tinyint(1) DEFAULT 1");
+            $wpdb->query("ALTER TABLE {$this->table_name} ADD INDEX status_key (status)");
+        }
+        
+        if (!in_array('hits', $column_names)) {
+            $wpdb->query("ALTER TABLE {$this->table_name} ADD COLUMN hits int(11) DEFAULT 1");
+        }
+        
+        // Update all existing records to have proper status and hits values
+        $wpdb->query("UPDATE {$this->table_name} SET status = 1 WHERE status IS NULL OR status = 0");
+        $wpdb->query("UPDATE {$this->table_name} SET hits = 1 WHERE hits IS NULL OR hits = 0");
+        
+        // Update database version
+        update_option('security_bot_db_version', $this->db_version);
     }
     
     public function add_blackhole_trap() {
-        // Don't show trap to logged-in users
-        if (is_user_logged_in()) {
+        // Don't show trap to logged-in users or admins
+        if (is_user_logged_in() || current_user_can('manage_options')) {
             return;
         }
         
@@ -104,14 +157,28 @@ class BotBlackhole {
     }
     
     public function check_bot_access() {
-        // Skip all checks for logged-in users
-        if (is_user_logged_in()) {
+        // CRITICAL: Skip all checks for logged-in users and admins
+        if (is_user_logged_in() || current_user_can('manage_options')) {
+            return;
+        }
+        
+        // Skip checks for admin area and login page unless specifically enabled
+        if (is_admin() && !$this->get_option('security_protect_admin', false)) {
+            return;
+        }
+        
+        if ($this->is_login_page() && !$this->get_option('security_protect_login', false)) {
             return;
         }
         
         $ip = $this->get_client_ip();
         $user_agent = $this->get_user_agent();
         $request_uri = $_SERVER['REQUEST_URI'];
+        
+        // Enhanced whitelist check - FIRST priority
+        if ($this->is_whitelisted($ip, $user_agent, $request_uri)) {
+            return;
+        }
         
         // Fast IP block check using transient cache
         $blocked_transient = 'bot_blocked_' . md5($ip);
@@ -124,44 +191,130 @@ class BotBlackhole {
             $this->trap_bot($ip, $user_agent, 'Accessed blackhole trap');
         }
         
-        // Check if bot is whitelisted (fast check first)
-        if ($this->is_bot_whitelisted($user_agent, $ip)) {
-            return;
-        }
+        // Enhanced bot detection with scoring system
+        $bot_score = $this->calculate_bot_score($ip, $user_agent, $request_uri);
         
-        // Check for bad bot patterns
-        if ($this->is_bad_bot($user_agent)) {
-            $this->trap_bot($ip, $user_agent, 'Bad bot user agent detected');
-        }
-        
-        // Check for suspicious behavior patterns
-        if ($this->is_suspicious_behavior($ip, $user_agent, $request_uri)) {
-            $this->trap_bot($ip, $user_agent, 'Suspicious behavior detected');
+        if ($bot_score >= 100) {
+            $this->trap_bot($ip, $user_agent, 'High bot score: ' . $bot_score);
+        } elseif ($bot_score >= 70) {
+            // Log suspicious activity but don't block yet
+            $this->log_suspicious_activity($ip, $user_agent, $request_uri, 'Suspicious score: ' . $bot_score);
         }
     }
     
-    private function is_bot_whitelisted($user_agent, $ip) {
-        // Check whitelisted IPs first (faster)
-        if ($this->whitelisted_ips_cache === null) {
-            $whitelist_ips = $this->get_option('security_bot_whitelist_ips', $this->get_default_whitelist_ips());
-            $this->whitelisted_ips_cache = array_filter(array_map('trim', explode("\n", $whitelist_ips)));
+    private function is_login_page() {
+        return in_array($GLOBALS['pagenow'], array('wp-login.php', 'wp-register.php'));
+    }
+    
+    private function is_whitelisted($ip, $user_agent, $request_uri) {
+        if ($this->whitelist_cache === null) {
+            $this->build_whitelist_cache();
         }
         
-        foreach ($this->whitelisted_ips_cache as $whitelisted_ip) {
-            if (strpos($ip, $whitelisted_ip) === 0) {
+        // Check whitelisted IPs (including ranges)
+        foreach ($this->whitelist_cache['ips'] as $whitelisted_ip) {
+            if ($this->ip_in_range($ip, $whitelisted_ip)) {
                 return true;
             }
         }
         
         // Check whitelisted user agents
-        if ($this->whitelisted_bots_cache === null) {
-            $whitelist_bots = $this->get_option('security_bot_whitelist_agents', $this->get_default_whitelist_bots());
-            $this->whitelisted_bots_cache = array_filter(array_map('trim', explode("\n", strtolower($whitelist_bots))));
+        $user_agent_lower = strtolower($user_agent);
+        foreach ($this->whitelist_cache['agents'] as $whitelisted_agent) {
+            if (strpos($user_agent_lower, $whitelisted_agent) !== false) {
+                return true;
+            }
         }
         
-        $user_agent_lower = strtolower($user_agent);
-        foreach ($this->whitelisted_bots_cache as $whitelisted_bot) {
-            if (strpos($user_agent_lower, strtolower($whitelisted_bot)) !== false) {
+        // Check for legitimate browser patterns
+        if ($this->is_legitimate_browser($user_agent)) {
+            return true;
+        }
+        
+        // Check for WordPress core requests
+        if ($this->is_wordpress_core_request($request_uri)) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    private function build_whitelist_cache() {
+        // Get custom whitelisted IPs
+        $custom_ips = $this->get_option('security_bot_whitelist_ips', '');
+        $whitelist_ips = array_filter(array_map('trim', explode("\n", $custom_ips)));
+        
+        // Add default safe IPs
+        $default_ips = array(
+            '127.0.0.1',
+            '::1',
+            $_SERVER['SERVER_ADDR'] ?? '',
+            $_SERVER['REMOTE_ADDR'] ?? ''
+        );
+        
+        $whitelist_ips = array_merge($whitelist_ips, array_filter($default_ips));
+        
+        // Get custom whitelisted user agents
+        $custom_agents = $this->get_option('security_bot_whitelist_agents', $this->get_default_whitelist_bots());
+        $whitelist_agents = array_filter(array_map('trim', explode("\n", strtolower($custom_agents))));
+        
+        $this->whitelist_cache = array(
+            'ips' => array_unique($whitelist_ips),
+            'agents' => array_unique($whitelist_agents)
+        );
+    }
+    
+    private function ip_in_range($ip, $range) {
+        if (strpos($range, '/') === false) {
+            // Single IP
+            return $ip === $range || strpos($ip, $range) === 0;
+        }
+        
+        // CIDR range
+        list($subnet, $mask) = explode('/', $range);
+        if ((ip2long($ip) & ~((1 << (32 - $mask)) - 1)) == ip2long($subnet)) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    private function is_legitimate_browser($user_agent) {
+        $legitimate_patterns = array(
+            '/Mozilla\/.*Chrome\/.*Safari/i',
+            '/Mozilla\/.*Firefox/i',
+            '/Mozilla\/.*Safari.*Version/i',
+            '/Mozilla\/.*Edge/i',
+            '/Mozilla\/.*Opera/i'
+        );
+        
+        foreach ($legitimate_patterns as $pattern) {
+            if (preg_match($pattern, $user_agent)) {
+                // Additional check for common browser characteristics
+                if (strpos($user_agent, 'Mozilla') !== false && 
+                    (strpos($user_agent, 'Chrome') !== false || 
+                     strpos($user_agent, 'Firefox') !== false || 
+                     strpos($user_agent, 'Safari') !== false)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    private function is_wordpress_core_request($request_uri) {
+        $core_paths = array(
+            '/wp-admin/',
+            '/wp-includes/',
+            '/wp-content/',
+            '/wp-login.php',
+            '/wp-cron.php',
+            '/xmlrpc.php'
+        );
+        
+        foreach ($core_paths as $path) {
+            if (strpos($request_uri, $path) === 0) {
                 return true;
             }
         }
@@ -169,63 +322,108 @@ class BotBlackhole {
         return false;
     }
     
-    private function is_bad_bot($user_agent) {
-        if ($this->blocked_bots_cache === null) {
-            $blocked_bots = $this->get_option('security_bot_blacklist_agents', $this->get_default_bad_bots());
-            $this->blocked_bots_cache = array_filter(array_map('trim', explode("\n", strtolower($blocked_bots))));
+    private function calculate_bot_score($ip, $user_agent, $request_uri) {
+        $score = 0;
+        
+        // User agent analysis
+        $score += $this->analyze_user_agent($user_agent);
+        
+        // Request pattern analysis
+        $score += $this->analyze_request_pattern($request_uri);
+        
+        // Behavioral analysis
+        $score += $this->analyze_behavior($ip);
+        
+        return $score;
+    }
+    
+    private function analyze_user_agent($user_agent) {
+        $score = 0;
+        $ua_lower = strtolower($user_agent);
+        
+        // Empty or minimal user agent
+        if (empty($user_agent) || $user_agent === '-') {
+            $score += 50;
         }
         
-        $user_agent_lower = strtolower($user_agent);
-        foreach ($this->blocked_bots_cache as $bad_bot) {
-            if (strpos($user_agent_lower, $bad_bot) !== false) {
-                return true;
+        // Known bad bot patterns
+        $bad_patterns = array(
+            'bot', 'crawler', 'spider', 'scraper', 'scanner', 'harvester',
+            'extractor', 'libwww', 'curl', 'wget', 'python', 'perl', 'java',
+            'php', 'masscan', 'nmap', 'sqlmap', 'nikto'
+        );
+        
+        foreach ($bad_patterns as $pattern) {
+            if (strpos($ua_lower, $pattern) !== false) {
+                $score += 30;
             }
         }
         
-        return false;
+        // Suspicious characteristics
+        if (strlen($user_agent) < 20) {
+            $score += 20;
+        }
+        
+        if (!preg_match('/Mozilla/i', $user_agent) && !$this->is_known_good_bot($ua_lower)) {
+            $score += 25;
+        }
+        
+        return $score;
     }
     
-    private function is_suspicious_behavior($ip, $user_agent, $request_uri) {
-        // Check for common bot patterns
+    private function analyze_request_pattern($request_uri) {
+        $score = 0;
+        
+        // Suspicious request patterns
         $suspicious_patterns = array(
-            // Empty or suspicious user agents
-            '/^$/',
-            '/^-$/',
-            '/bot/i',
-            '/crawler/i',
-            '/spider/i',
-            '/scraper/i',
-            '/scanner/i',
-            '/harvester/i',
-            '/extractor/i',
-            '/libwww/i',
-            '/curl/i',
-            '/wget/i',
-            '/python/i',
-            '/perl/i',
-            '/java/i',
-            '/php/i',
+            '/wp-config', '/xmlrpc', '/.env', '/phpmyadmin',
+            '/admin', '/wp-json/wp/v2/users', '/.git',
+            '/backup', '/sql', '/database'
         );
         
         foreach ($suspicious_patterns as $pattern) {
-            if (preg_match($pattern, $user_agent)) {
-                return true;
+            if (strpos($request_uri, $pattern) !== false) {
+                $score += 40;
             }
         }
         
-        // Check for suspicious request patterns
-        $suspicious_uris = array(
-            '/wp-config',
-            '/xmlrpc',
-            '/.env',
-            '/admin',
-            '/phpmyadmin',
-            '/wp-admin/admin-ajax.php',
-            '/wp-json/wp/v2/users',
+        // Multiple consecutive requests (rate limiting)
+        $ip = $this->get_client_ip();
+        $request_count = get_transient('bot_requests_' . md5($ip));
+        if ($request_count && $request_count > 10) {
+            $score += 30;
+        }
+        
+        return $score;
+    }
+    
+    private function analyze_behavior($ip) {
+        $score = 0;
+        
+        // Check if IP has been flagged before
+        global $wpdb;
+        $previous_blocks = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$this->table_name} 
+             WHERE ip_address = %s AND timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+            $ip
+        ));
+        
+        if ($previous_blocks > 0) {
+            $score += ($previous_blocks * 10);
+        }
+        
+        return $score;
+    }
+    
+    private function is_known_good_bot($user_agent) {
+        $good_bots = array(
+            'googlebot', 'bingbot', 'slurp', 'duckduckbot', 'baiduspider',
+            'yandexbot', 'facebookexternalhit', 'twitterbot', 'linkedinbot',
+            'pinterestbot', 'applebot', 'ia_archiver'
         );
         
-        foreach ($suspicious_uris as $uri) {
-            if (strpos($request_uri, $uri) !== false) {
+        foreach ($good_bots as $bot) {
+            if (strpos($user_agent, $bot) !== false) {
                 return true;
             }
         }
@@ -233,7 +431,35 @@ class BotBlackhole {
         return false;
     }
     
+    private function log_suspicious_activity($ip, $user_agent, $request_uri, $reason) {
+        global $wpdb;
+        
+        try {
+            $wpdb->insert(
+                $this->table_name,
+                array(
+                    'ip_address' => $ip,
+                    'user_agent' => $user_agent,
+                    'request_uri' => $request_uri,
+                    'referrer' => isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '',
+                    'timestamp' => current_time('mysql'),
+                    'block_reason' => $reason,
+                    'status' => 0, // 0 = suspicious, 1 = blocked
+                    'hits' => 1
+                ),
+                array('%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d')
+            );
+        } catch (Exception $e) {
+            error_log('Bot Blackhole Log Error: ' . $e->getMessage());
+        }
+    }
+    
     private function trap_bot($ip, $user_agent, $reason) {
+        // Final safety check - never block admins or logged-in users
+        if (is_user_logged_in() || current_user_can('manage_options')) {
+            return;
+        }
+        
         // Log the bot
         $this->log_blocked_bot($ip, $user_agent, $_SERVER['REQUEST_URI'], $reason);
         
@@ -254,20 +480,42 @@ class BotBlackhole {
         global $wpdb;
         
         try {
-            $wpdb->insert(
-                $this->table_name,
-                array(
-                    'ip_address' => $ip,
-                    'user_agent' => $user_agent,
-                    'request_uri' => $request_uri,
-                    'referrer' => isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '',
-                    'timestamp' => current_time('mysql'),
-                    'block_reason' => $reason
-                ),
-                array('%s', '%s', '%s', '%s', '%s', '%s')
-            );
+            // Check if this IP was already blocked recently
+            $existing = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, hits FROM {$this->table_name} 
+                 WHERE ip_address = %s AND status = 1 
+                 AND timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                 ORDER BY timestamp DESC LIMIT 1",
+                $ip
+            ));
+            
+            if ($existing) {
+                // Update hit count
+                $wpdb->update(
+                    $this->table_name,
+                    array('hits' => $existing->hits + 1, 'timestamp' => current_time('mysql')),
+                    array('id' => $existing->id),
+                    array('%d', '%s'),
+                    array('%d')
+                );
+            } else {
+                // Insert new record
+                $wpdb->insert(
+                    $this->table_name,
+                    array(
+                        'ip_address' => $ip,
+                        'user_agent' => $user_agent,
+                        'request_uri' => $request_uri,
+                        'referrer' => isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '',
+                        'timestamp' => current_time('mysql'),
+                        'block_reason' => $reason,
+                        'status' => 1,
+                        'hits' => 1
+                    ),
+                    array('%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d')
+                );
+            }
         } catch (Exception $e) {
-            // Fail silently to avoid breaking the site
             error_log('Bot Blackhole Log Error: ' . $e->getMessage());
         }
     }
@@ -281,7 +529,8 @@ class BotBlackhole {
         $message .= "User Agent: " . $user_agent . "\n";
         $message .= "Reason: " . $reason . "\n";
         $message .= "Time: " . current_time('mysql') . "\n";
-        $message .= "Site: " . home_url() . "\n";
+        $message .= "Site: " . home_url() . "\n\n";
+        $message .= "To whitelist this IP, add it to Security Settings > Bot Protection > Whitelisted IPs\n";
         
         wp_mail($email, $subject, $message);
     }
@@ -297,7 +546,6 @@ class BotBlackhole {
             header('HTTP/1.1 410 Gone');
             header('Status: 410 Gone');
         } elseif ($status_code == 444) {
-            // Nginx-style "no response" - just close connection
             header('HTTP/1.1 444 No Response');
             header('Status: 444 No Response');
         } else {
@@ -307,12 +555,10 @@ class BotBlackhole {
         
         header('Content-Type: text/html; charset=utf-8');
         
-        // For 444 status, don't send any content
         if ($status_code == 444) {
             exit;
         }
         
-        // Custom block page
         $custom_message = $this->get_option('security_bot_custom_message', '');
         if (!empty($custom_message)) {
             echo $custom_message;
@@ -398,130 +644,6 @@ jetpack
 wordfence';
     }
     
-    private function get_default_whitelist_ips() {
-        $server_ip = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : '';
-        $remote_ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
-        
-        $default_ips = array();
-        if ($server_ip) $default_ips[] = $server_ip;
-        if ($remote_ip) $default_ips[] = $remote_ip;
-        
-        // Add common CDN and service IPs
-        $default_ips[] = '127.0.0.1';
-        $default_ips[] = '::1';
-        
-        return implode("\n", array_unique($default_ips));
-    }
-    
-    private function get_default_bad_bots() {
-        return 'masscan
-nmap
-sqlmap
-nikto
-w3af
-skipfish
-openvas
-nessus
-acunetix
-burpsuite
-owasp
-zap
-havij
-pangolin
-sqlninja
-bsqlbf
-mole
-bbqsql
-jsql
-sqlsus
-safe3si
-pangolin
-havij
-sqlpoizon
-sqlbrute
-sql power injector
-marathon
-nsauditor
-netsparker
-appscan
-webinspect
-paros
-webscarab
-grendel-scan
-n-stealth
-shadow security scanner
-sara
-saint
-retina
-cybercop
-internet scanner
-kane security analyst
-x-scan
-superscan
-netscan
-languard
-gfi
-eeye
-foundstone
-rapid7
-qualys
-tenable
-beyondtrust
-tripwire
-alienvault
-mcafee
-symantec
-trendmicro
-kaspersky
-bitdefender
-avast
-avg
-eset
-sophos
-panda
-f-secure
-comodo
-zonealarm
-malwarebytes
-spybot
-adaware
-ccleaner
-regcleaner
-registry mechanic
-registry booster
-registry easy
-registry fix
-registry first aid
-registry patrol
-registry repair
-registry reviver
-registry smart
-registry winner
-tuneup
-advanced systemcare
-iobit
-glary
-wise
-auslogics
-ashampoo
-magix
-nero
-roxio
-cyberlink
-corel
-adobe
-microsoft
-apple
-google
-mozilla
-opera
-safari
-chrome
-firefox
-internet explorer
-edge';
-    }
-    
     public function schedule_cleanup() {
         if (!wp_next_scheduled('bot_blackhole_cleanup')) {
             wp_schedule_event(time(), 'daily', 'bot_blackhole_cleanup');
@@ -536,7 +658,7 @@ edge';
             "DELETE FROM {$this->table_name} WHERE timestamp < DATE_SUB(NOW(), INTERVAL 30 DAY)"
         );
         
-        // Keep only 1000 most recent entries to prevent database bloat
+        // Keep only 1000 most recent entries
         $wpdb->query(
             "DELETE FROM {$this->table_name} WHERE id NOT IN (
                 SELECT id FROM (
@@ -551,26 +673,71 @@ edge';
         
         $stats = array();
         
-        // Total blocked bots
-        $stats['total'] = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name}");
+        // Total blocked bots (with null safety)
+        $stats['total'] = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name} WHERE status = 1");
         
-        // Blocked today
-        $stats['today'] = $wpdb->get_var(
-            "SELECT COUNT(*) FROM {$this->table_name} WHERE DATE(timestamp) = CURDATE()"
+        // Blocked today (with null safety)
+        $stats['today'] = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$this->table_name} WHERE status = 1 AND DATE(timestamp) = CURDATE()"
         );
         
-        // Blocked this week
-        $stats['week'] = $wpdb->get_var(
-            "SELECT COUNT(*) FROM {$this->table_name} WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
+        // Blocked this week (with null safety)
+        $stats['week'] = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$this->table_name} WHERE status = 1 AND timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
         );
         
-        // Top blocked IPs
-        $stats['top_ips'] = $wpdb->get_results(
-            "SELECT ip_address, COUNT(*) as count FROM {$this->table_name} 
-             GROUP BY ip_address ORDER BY count DESC LIMIT 10",
+        // Top blocked IPs (with null safety)
+        $top_ips = $wpdb->get_results(
+            "SELECT ip_address, SUM(COALESCE(hits, 1)) as count FROM {$this->table_name} 
+             WHERE status = 1 GROUP BY ip_address ORDER BY count DESC LIMIT 10",
             ARRAY_A
         );
         
+        $stats['top_ips'] = is_array($top_ips) ? $top_ips : array();
+        
         return $stats;
+    }
+    
+    // Admin functions for managing blocked IPs
+    public function unblock_ip($ip) {
+        if (!current_user_can('manage_options')) {
+            return false;
+        }
+        
+        global $wpdb;
+        
+        // Remove from database
+        $wpdb->delete($this->table_name, array('ip_address' => $ip), array('%s'));
+        
+        // Remove from transient cache
+        $blocked_transient = 'bot_blocked_' . md5($ip);
+        delete_transient($blocked_transient);
+        
+        return true;
+    }
+    
+    public function whitelist_ip($ip) {
+        if (!current_user_can('manage_options')) {
+            return false;
+        }
+        
+        $current_whitelist = get_option('security_bot_whitelist_ips', '');
+        $whitelist_array = array_filter(array_map('trim', explode("\n", $current_whitelist)));
+        
+        if (!in_array($ip, $whitelist_array)) {
+            $whitelist_array[] = $ip;
+            $new_whitelist = implode("\n", $whitelist_array);
+            update_option('security_bot_whitelist_ips', $new_whitelist);
+            
+            // Clear cache
+            $this->whitelist_cache = null;
+            
+            // Unblock the IP
+            $this->unblock_ip($ip);
+            
+            return true;
+        }
+        
+        return false;
     }
 }
